@@ -1,0 +1,60 @@
+# ====================================
+# 敏感文件
+# ====================================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.secret
+
+# ====================================
+# Python
+# ====================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-info/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+.env-venv/
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# 日志
+*.log
+logs/
+flask.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
+
+# 跟踪文件
+.cp-man/
