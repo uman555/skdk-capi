@@ -2,15 +2,34 @@
 SKDK CAPI 集成 - Notion API 客户端
 =====================================
 负责：
-1. 在 SKDK B2B Leads CRM 数据库创建潜在客户记录
-2. 更新记录状态（Contacted → Qualified → Customer）
-3. 查询记录（按状态、按 ID）
+1. 在 SKDK B2B Leads CRM 页面下创建潜在客户子页面
+2. 更新子页面状态（Contacted → Qualified → Customer → Lost）
+3. 查询子页面（按状态、按 ID）
 4. 错误处理和重试
+
+存储模型（child_page）：
+- parent.page_id = SKDK B2B Leads CRM 页面 ID
+- properties.title = 潜在客户姓名（或邮箱当姓名缺失）
+- content blocks = bulleted_list_item，存储所有元数据
+  - "Email: buyer@example.com"
+  - "Status: Contacted"
+  - "Company: ABC Trading"
+  - "Country: United States"
+  - "Phone: +1-555-0100"
+  - "Business Type: Distributor"
+  - "Monthly Volume: 500-3,000 units"
+  - "Products: Knee Support | Sports Gloves"
+  - "Lead Value: 2500"
+  - "Created At: 2026-06-24 22:00"
+  - "Status Updated At: 2026-06-24 22:00"
+  - "Source: Meta Lead Form"
+  - "Notes: ..."
 """
 
 import logging
+import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -23,22 +42,45 @@ from config import (
 )
 
 
+# ====================================
+# 元数据字段定义（统一管理，避免拼写错误）
+# ====================================
+class Field:
+    """Notion bulleted_list_item 中的元数据字段名"""
+    EMAIL = "Email"
+    STATUS = "Status"
+    COMPANY = "Company"
+    COUNTRY = "Country"
+    PHONE = "Phone"
+    BUSINESS_TYPE = "Business Type"
+    MONTHLY_VOLUME = "Monthly Volume"
+    PRODUCTS = "Products"
+    LEAD_VALUE = "Lead Value"
+    CREATED_AT = "Created At"
+    STATUS_UPDATED_AT = "Status Updated At"
+    SOURCE = "Source"
+    NOTES = "Notes"
+
+
+# 状态默认值
+DEFAULT_STATUS = "Contacted"
+VALID_STATUSES = {"Contacted", "Qualified", "Customer", "Lost"}
+
+
 class NotionClient:
     """
-    Notion API 客户端
-    封装 SKDK B2B Leads CRM 数据库的所有操作
+    Notion API 客户端（child_page 模型）
+    封装 SKDK B2B Leads CRM 页面下的所有子页面操作
     """
 
-    def __init__(self, token: str = None, database_id: str = None):
+    def __init__(self, token: str = None, page_id: str = None):
         """
         Args:
             token: Notion Integration Token（默认从 config 读取）
-            database_id: 数据库 ID 或 Page ID（默认从 config 读取）
-                        ⚠️ 如果是内嵌数据库，传入的是 page_id
-                        构造函数会自动解析真实的 database_id
+            page_id: SKDK B2B Leads CRM 页面 ID（默认从 config 读取）
         """
         self.token = token or NOTION_INTEGRATION_TOKEN
-        self.input_id = database_id or NOTION_DATABASE_ID
+        self.page_id = page_id or NOTION_DATABASE_ID
         self.base_url = NOTION_BASE_URL
         self.session = requests.Session()
         self.session.headers.update({
@@ -46,66 +88,18 @@ class NotionClient:
             "Notion-Version": NOTION_API_VERSION,
             "Content-Type": "application/json",
         })
-        # 自动解析真实的 database_id
-        self.database_id = self._resolve_database_id()
-        logger.info(f"Notion client initialized: database={self.database_id[:20]}...")
+        logger.info(f"Notion client initialized: page={self.page_id[:20]}...")
 
-    def _resolve_database_id(self) -> str:
-        """
-        解析真实的 database_id
-        如果传入的是 page_id（内嵌数据库），自动获取真实的 database_id
-
-        Returns:
-            真实的 database_id
-        """
-        # 先尝试直接作为 database 访问
-        try:
-            self._request("GET", f"/databases/{self.input_id}")
-            logger.info(f"✅ Input ID 是真实 database_id")
-            return self.input_id
-        except Exception:
-            # 失败说明是 page_id
-            try:
-                logger.info(f"⚙️ Input ID 不是 database_id，尝试作为 page_id 解析...")
-                page = self._request("GET", f"/pages/{self.input_id}")
-                parent = page.get("parent", {})
-                if parent.get("type") == "database_id":
-                    real_db_id = parent.get("database_id")
-                    logger.info(f"✅ 解析到真实 database_id: {real_db_id[:20]}...")
-                    return real_db_id
-                else:
-                    logger.warning(
-                        f"⚠️ Page parent type is {parent.get('type')}, not database_id. "
-                        f"Using original ID: {self.input_id}"
-                    )
-                    return self.input_id
-            except Exception as e:
-                logger.error(f"❌ 无法解析 database_id: {e}")
-                # 降级使用原 ID
-                return self.input_id
-
-    def _is_inline_database(self) -> bool:
-        """
-        判断当前配置的是 page_id（内嵌数据库）还是真正的 database_id
-        通过是否能直接访问 /databases/{id} 来判断
-
-        Returns:
-            True: 是内嵌数据库（用 page_id 操作）
-            False: 是独立数据库（用 database_id 操作）
-        """
-        try:
-            self._request("GET", f"/databases/{self.input_id}")
-            return False  # 可以直接访问 → 独立数据库
-        except Exception:
-            return True  # 不能直接访问 → 内嵌数据库（用 page_id）
-
+    # ==========================================
+    # 底层 HTTP 请求
+    # ==========================================
     def _request(self, method: str, endpoint: str, **kwargs) -> Dict:
         """
         统一的 HTTP 请求方法（带错误处理）
 
         Args:
-            method: HTTP 方法（GET/POST/PATCH）
-            endpoint: API 端点（如 /pages 或 /databases/{id}/query）
+            method: HTTP 方法（GET/POST/PATCH/DELETE）
+            endpoint: API 端点
             **kwargs: requests 参数
 
         Returns:
@@ -120,156 +114,259 @@ class NotionClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                logger.error(
-                    "❌ 401 Unauthorized: Notion Token 无效或过期\n"
-                    "   请检查 NOTION_INTEGRATION_TOKEN"
-                )
-            elif e.response.status_code == 404:
+            status = e.response.status_code
+            try:
+                error_data = e.response.json()
+                msg = error_data.get("message", "Unknown")
+            except Exception:
+                msg = e.response.text[:200]
+            if status == 401:
+                logger.error(f"❌ 401 Unauthorized: Notion Token 无效或过期 (msg={msg})")
+            elif status == 404:
                 logger.error(
                     f"❌ 404 Not Found: {endpoint}\n"
-                    f"   请确认数据库 ID 正确且已分享给 Integration"
+                    f"   请确认页面 ID 正确且已分享给 Integration"
                 )
             else:
-                try:
-                    error_data = e.response.json()
-                    logger.error(
-                        f"❌ HTTP {e.response.status_code}: {error_data.get('message', 'Unknown')}"
-                    )
-                except Exception:
-                    logger.error(f"❌ HTTP {e.response.status_code}: {e.response.text[:200]}")
+                logger.error(f"❌ HTTP {status}: {msg}")
             raise
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ 网络错误: {e}")
             raise
 
     # ==========================================
-    # 创建新潜在客户
+    # 元数据解析：bulleted_list_item → dict
+    # ==========================================
+    @staticmethod
+    def _parse_metadata_blocks(blocks: List[Dict]) -> Dict[str, str]:
+        """
+        解析子页面的 content blocks，提取 key:value 形式的元数据
+
+        支持格式：
+        - bulleted_list_item: "Email: buyer@example.com"
+        - paragraph: "Email: buyer@example.com"
+        - 任何 rich_text block: "Status: Qualified"
+
+        Returns:
+            {"Email": "buyer@example.com", "Status": "Qualified", ...}
+        """
+        metadata: Dict[str, str] = {}
+        for block in blocks:
+            btype = block.get("type")
+            rich = block.get(btype, {}).get("rich_text", [])
+            text = "".join(rt.get("plain_text", "") for rt in rich).strip()
+            if not text:
+                continue
+            # 解析 "Key: Value" 或 "Key：Value"（中英文冒号都支持）
+            match = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", text, re.DOTALL)
+            if match:
+                key = match.group(1).strip()
+                value = match.group(2).strip()
+                metadata[key] = value
+        return metadata
+
+    @staticmethod
+    def _build_bullet(field: str, value) -> Dict:
+        """
+        构造一个 bulleted_list_item block
+
+        Args:
+            field: 字段名（自动加冒号）
+            value: 字段值
+
+        Returns:
+            Notion block dict
+        """
+        if value is None or value == "":
+            text = f"{field}: "
+        elif isinstance(value, list):
+            text = f"{field}: " + " | ".join(str(v) for v in value)
+        else:
+            text = f"{field}: {value}"
+        return {
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {
+                "rich_text": [{"type": "text", "text": {"content": text}}]
+            },
+        }
+
+    # ==========================================
+    # 子页面 CRUD
     # ==========================================
     def create_lead(self, lead_data: Dict) -> str:
         """
-        在 SKDK B2B Leads CRM 数据库创建新潜在客户
+        在 SKDK B2B Leads CRM 页面下创建新潜在客户子页面
 
         Args:
-            lead_data: 潜在客户数据字典，必填字段：
-                - email (str): 邮箱
-                - name (str, optional): 姓名
+            lead_data: 潜在客户数据字典
+                - email (str, 必填): 邮箱
+                - name (str, optional): 姓名（缺失则用 email 作为 title）
                 - phone (str, optional): 电话
                 - company (str, optional): 公司名
                 - country (str, optional): 国家/地区
                 - business_type (str, optional): 客户类型
                 - monthly_volume (str, optional): 月采购量
                 - products (list, optional): 产品兴趣列表
+                - notes (str, optional): 备注
+                - lead_value (float, optional): 预估订单价值
+                - source (str, optional): 来源（默认 "Meta Lead Form"）
 
         Returns:
             Notion 页面 ID
 
-        Examples:
-            >>> lead_id = notion.create_lead({
-            ...     "email": "test@example.com",
-            ...     "name": "John Doe",
-            ...     "company": "ABC Trading",
-            ...     "country": "United States",
-            ...     "business_type": "Distributor / Wholesaler",
-            ...     "monthly_volume": "500-3,000 units",
-            ...     "products": ["Knee Support", "Sports Gloves"]
-            ... })
+        Raises:
+            ValueError: 邮箱缺失
         """
-        properties = {
-            # ⚠️ 关键：Notion API 中 title 字段必须用 "title" 作为 key
-            # （display name 可以是 "Name"，但 API 字段名是 "title"）
-            "title": {
-                "title": [{"text": {"content": lead_data.get("name", "Unknown")}}]
-            },
-            "Email": {
-                "email": lead_data["email"]
-            },
-            "Source": {
-                "select": {"name": lead_data.get("source", "Meta Lead Form")}
-            },
-            "Status": {
-                "select": {"name": "Contacted"}  # 默认状态
-            },
-            "Status Updated At": {
-                "date": {"start": datetime.now().isoformat()}
-            },
-            "Created At": {
-                "date": {"start": datetime.now().isoformat()}
-            },
-        }
+        email = lead_data.get("email")
+        if not email:
+            raise ValueError("email is required")
 
-        # 可选字段
+        # title 用姓名，缺失则用邮箱
+        title = lead_data.get("name") or email
+        now_iso = datetime.now().isoformat()
+
+        # 构造 content blocks（顺序固定，方便查阅）
+        bullets = []
+        bullets.append(self._build_bullet(Field.EMAIL, email))
+        bullets.append(self._build_bullet(Field.STATUS, DEFAULT_STATUS))
+        if lead_data.get("source"):
+            bullets.append(self._build_bullet(Field.SOURCE, lead_data["source"]))
         if lead_data.get("phone"):
-            properties["Phone"] = {"phone_number": lead_data["phone"]}
+            bullets.append(self._build_bullet(Field.PHONE, lead_data["phone"]))
         if lead_data.get("company"):
-            properties["Company"] = {
-                "rich_text": [{"text": {"content": lead_data["company"]}}]
-            }
+            bullets.append(self._build_bullet(Field.COMPANY, lead_data["company"]))
         if lead_data.get("country"):
-            properties["Country"] = {"select": {"name": lead_data["country"]}}
+            bullets.append(self._build_bullet(Field.COUNTRY, lead_data["country"]))
         if lead_data.get("business_type"):
-            properties["Business Type"] = {
-                "select": {"name": lead_data["business_type"]}
-            }
+            bullets.append(self._build_bullet(Field.BUSINESS_TYPE, lead_data["business_type"]))
         if lead_data.get("monthly_volume"):
-            properties["Monthly Volume"] = {
-                "select": {"name": lead_data["monthly_volume"]}
-            }
+            bullets.append(self._build_bullet(Field.MONTHLY_VOLUME, lead_data["monthly_volume"]))
         if lead_data.get("products"):
-            properties["Product Interest"] = {
-                "multi_select": [
-                    {"name": p} for p in lead_data["products"]
-                ]
-            }
-        if lead_data.get("notes"):
-            properties["Notes"] = {
-                "rich_text": [{"text": {"content": lead_data["notes"]}}]
-            }
+            bullets.append(self._build_bullet(Field.PRODUCTS, lead_data["products"]))
         if lead_data.get("lead_value"):
-            properties["Lead Value"] = {"number": lead_data["lead_value"]}
+            bullets.append(self._build_bullet(Field.LEAD_VALUE, lead_data["lead_value"]))
+        if lead_data.get("notes"):
+            bullets.append(self._build_bullet(Field.NOTES, lead_data["notes"]))
+        bullets.append(self._build_bullet(Field.CREATED_AT, now_iso))
+        bullets.append(self._build_bullet(Field.STATUS_UPDATED_AT, now_iso))
 
         payload = {
-            "parent": {"page_id": self.input_id},
-            "properties": properties,
+            "parent": {"page_id": self.page_id},
+            "properties": {
+                "title": {"title": [{"text": {"content": title}}]}
+            },
+            "children": bullets,
         }
 
         result = self._request("POST", "/pages", json=payload)
         page_id = result["id"]
-        logger.info(
-            f"✅ Notion 创建潜在客户成功: {lead_data['email']} (id={page_id})"
-        )
+        logger.info(f"✅ Notion 创建潜在客户成功: {email} (id={page_id[:20]}...)")
         return page_id
 
-    # ==========================================
-    # 更新记录状态
-    # ==========================================
-    def update_status(self, page_id: str, new_status: str) -> Dict:
+    def get_page(self, page_id: str) -> Dict:
         """
-        更新 Notion 记录的状态字段
+        获取子页面详情（含 content blocks 解析后的 metadata）
 
         Args:
             page_id: Notion 页面 ID
-            new_status: 新状态（Contacted / Qualified / Customer / Lost）
+
+        Returns:
+            {
+                "id": "...",
+                "title": "John Doe",
+                "metadata": {"Email": "...", "Status": "...", ...},
+                "raw": {...}  # 原始 page object
+            }
+        """
+        page = self._request("GET", f"/pages/{page_id}")
+        blocks = self._get_blocks(page_id)
+        metadata = self._parse_metadata_blocks(blocks)
+        # 提取 title
+        title = ""
+        title_prop = page.get("properties", {}).get("title", {})
+        for t in title_prop.get("title", []):
+            title += t.get("plain_text", "")
+        return {
+            "id": page_id,
+            "title": title,
+            "metadata": metadata,
+            "raw": page,
+        }
+
+    def _get_blocks(self, block_id: str) -> List[Dict]:
+        """
+        获取 block 的所有子 blocks（自动翻页）
+
+        Args:
+            block_id: page 或 block 的 ID
+
+        Returns:
+            blocks 列表
+        """
+        all_blocks = []
+        has_more = True
+        start_cursor = None
+        while has_more:
+            params = {"page_size": 100}
+            if start_cursor:
+                params["start_cursor"] = start_cursor
+            try:
+                result = self._request("GET", f"/blocks/{block_id}/children", params=params)
+            except Exception as e:
+                logger.error(f"❌ 获取 blocks 失败 {block_id}: {e}")
+                break
+            all_blocks.extend(result.get("results", []))
+            has_more = result.get("has_more", False)
+            start_cursor = result.get("next_cursor")
+        return all_blocks
+
+    def get_email_by_page_id(self, page_id: str) -> Optional[str]:
+        """
+        通过 page_id 提取 Email 字段
+
+        Args:
+            page_id: Notion 页面 ID
+
+        Returns:
+            邮箱地址（如果存在）
+        """
+        try:
+            page = self.get_page(page_id)
+            return page["metadata"].get(Field.EMAIL)
+        except Exception as e:
+            logger.error(f"❌ 获取邮箱失败 {page_id}: {e}")
+            return None
+
+    # ==========================================
+    # 更新操作
+    # ==========================================
+    def update_status(self, page_id: str, new_status: str) -> Dict:
+        """
+        更新子页面的 Status 字段（同时更新 Status Updated At）
+
+        实现方式：找到 Status block → 替换文本
+        找不到时在末尾追加
+
+        Args:
+            page_id: Notion 页面 ID
+            new_status: 新状态（Contacted/Qualified/Customer/Lost）
 
         Returns:
             API 响应
         """
-        payload = {
-            "properties": {
-                "Status": {"select": {"name": new_status}},
-                "Status Updated At": {
-                    "date": {"start": datetime.now().isoformat()}
-                },
-            }
-        }
+        if new_status not in VALID_STATUSES:
+            logger.warning(f"⚠️ 非标准状态: {new_status}（仍会更新）")
 
-        result = self._request("PATCH", f"/pages/{page_id}", json=payload)
-        logger.info(f"✅ Notion 更新状态: {page_id} → {new_status}")
-        return result
+        now_iso = datetime.now().isoformat()
+        return self._update_field(page_id, Field.STATUS, new_status, [
+            (Field.STATUS, new_status),
+            (Field.STATUS_UPDATED_AT, now_iso),
+        ])
 
     def update_lead_value(self, page_id: str, value: float) -> Dict:
         """
-        更新 Notion 记录的预估订单价值
+        更新子页面的 Lead Value 字段
 
         Args:
             page_id: Notion 页面 ID
@@ -278,18 +375,13 @@ class NotionClient:
         Returns:
             API 响应
         """
-        payload = {
-            "properties": {
-                "Lead Value": {"number": value}
-            }
-        }
-        result = self._request("PATCH", f"/pages/{page_id}", json=payload)
-        logger.info(f"✅ Notion 更新 Lead Value: {page_id} → {value}")
-        return result
+        return self._update_field(page_id, Field.LEAD_VALUE, value, [
+            (Field.LEAD_VALUE, value),
+        ])
 
     def add_note(self, page_id: str, note: str) -> Dict:
         """
-        追加销售备注到 Notion 记录
+        追加销售备注到子页面（在 Notes 块中追加新行）
 
         Args:
             page_id: Notion 页面 ID
@@ -298,122 +390,119 @@ class NotionClient:
         Returns:
             API 响应
         """
-        # 获取当前备注
-        page = self.get_page(page_id)
-        current_notes = ""
-        notes_prop = page.get("properties", {}).get("Notes", {})
-        if notes_prop.get("rich_text"):
-            current_notes = "".join(
-                [rt.get("plain_text", "") for rt in notes_prop["rich_text"]]
-            )
+        # 1. 找到现有的 Notes 块
+        blocks = self._get_blocks(page_id)
+        existing_notes_value = ""
+        notes_block_id = None
+        for b in blocks:
+            if b.get("type") != "bulleted_list_item":
+                continue
+            rich = b["bulleted_list_item"].get("rich_text", [])
+            text = "".join(rt.get("plain_text", "") for rt in rich)
+            match = re.match(r"^Notes\s*[:：]\s*(.*)$", text, re.DOTALL)
+            if match:
+                notes_block_id = b["id"]
+                existing_notes_value = match.group(1).strip()
+                break
 
-        # 追加新备注
-        new_notes = f"{current_notes}\n[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {note}".strip()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        new_value = (
+            f"{existing_notes_value}\n[{timestamp}] {note}".strip()
+            if existing_notes_value
+            else f"[{timestamp}] {note}"
+        )
 
-        payload = {
-            "properties": {
-                "Notes": {
-                    "rich_text": [{"text": {"content": new_notes}}]
+        if notes_block_id:
+            # 2a. 更新现有 Notes 块
+            payload = {
+                "bulleted_list_item": {
+                    "rich_text": [{"type": "text", "text": {"content": f"Notes: {new_value}"}}]
                 }
             }
-        }
-        result = self._request("PATCH", f"/pages/{page_id}", json=payload)
-        logger.info(f"✅ Notion 添加备注: {page_id}")
-        return result
+            result = self._request("PATCH", f"/blocks/{notes_block_id}", json=payload)
+            logger.info(f"✅ Notion 更新 Notes: {page_id[:20]}...")
+            return result
+        else:
+            # 2b. 追加新 Notes 块
+            new_block = self._build_bullet(Field.NOTES, new_value)
+            result = self._request("PATCH", f"/blocks/{page_id}/children", json={
+                "children": [new_block]
+            })
+            logger.info(f"✅ Notion 添加 Notes: {page_id[:20]}...")
+            return result
 
-    # ==========================================
-    # 查询记录
-    # ==========================================
-    def get_page(self, page_id: str) -> Dict:
+    def _update_field(
+        self, page_id: str, primary_field: str, primary_value, all_updates: List[Tuple[str, str]]
+    ) -> Dict:
         """
-        通过 Notion 页面 ID 获取记录详情
+        通用字段更新方法
 
         Args:
             page_id: Notion 页面 ID
+            primary_field: 必填字段（如果找不到则新建）
+            primary_value: 必填值
+            all_updates: [(field, value), ...] 全部要更新的字段
 
         Returns:
-            页面详情字典
+            最后一个 API 响应
         """
-        return self._request("GET", f"/pages/{page_id}")
+        blocks = self._get_blocks(page_id)
+        existing_field_ids = {}  # field_name → block_id
+        for b in blocks:
+            if b.get("type") != "bulleted_list_item":
+                continue
+            rich = b["bulleted_list_item"].get("rich_text", [])
+            text = "".join(rt.get("plain_text", "") for rt in rich)
+            match = re.match(r"^([^:：]+)\s*[:：]", text)
+            if match:
+                existing_field_ids[match.group(1).strip()] = b["id"]
 
+        last_result = None
+        for field, value in all_updates:
+            text = f"{field}: " + (
+                " | ".join(str(v) for v in value) if isinstance(value, list)
+                else str(value) if value is not None else ""
+            )
+            payload = {
+                "bulleted_list_item": {
+                    "rich_text": [{"type": "text", "text": {"content": text}}]
+                }
+            }
+            if field in existing_field_ids:
+                self._request("PATCH", f"/blocks/{existing_field_ids[field]}", json=payload)
+            else:
+                self._request("PATCH", f"/blocks/{page_id}/children", json={
+                    "children": [self._build_bullet(field, value)]
+                })
+            last_result = {"field": field, "value": value}
+
+        logger.info(f"✅ Notion 更新字段: {page_id[:20]}... ({primary_field}={primary_value})")
+        return last_result or {}
+
+    # ==========================================
+    # 查询操作
+    # ==========================================
     def get_leads_by_status(self, status: str, limit: int = 100) -> List[Dict]:
         """
         获取所有指定状态的潜在客户
 
         Args:
-            status: 状态名（Contacted / Qualified / Customer / Lost）
+            status: 状态名
             limit: 最多返回数量
 
         Returns:
-            潜在客户列表
+            潜在客户列表（每个元素是 get_page() 返回的 dict）
 
         Examples:
             >>> leads = notion.get_leads_by_status("Qualified")
             >>> for lead in leads:
-            ...     print(lead["id"], lead["properties"]["Email"]["email"])
+            ...     print(lead["id"], lead["metadata"]["Email"])
         """
-        if self._is_inline_database():
-            # 内嵌数据库：用 page_id 作为 parent 查询
-            return self._get_children_by_status(self.input_id, status, limit)
-        else:
-            payload = {
-                "filter": {
-                    "property": "Status",
-                    "select": {"equals": status}
-                },
-                "page_size": min(limit, 100)
-            }
-            result = self._request("POST", f"/databases/{self.database_id}/query", json=payload)
-            leads = result.get("results", [])
-            logger.info(f"✅ Notion 查询 '{status}' 状态: {len(leads)} 条")
-            return leads
-
-    def _get_children_by_status(self, page_id: str, status: str, limit: int = 100) -> List[Dict]:
-        """
-        内嵌数据库的备用查询方法 - 通过 page 的 children API
-        ⚠️ 此方法只能获取所有子页面，无法在 API 层过滤
-        需要在客户端代码中过滤 status
-        """
-        all_children = []
-        has_more = True
-        start_cursor = None
-
-        while has_more and len(all_children) < limit:
-            params = {"page_size": 100}
-            if start_cursor:
-                params["start_cursor"] = start_cursor
-
-            url = f"{self.base_url}/blocks/{page_id}/children"
-            try:
-                response = self.session.get(url, params=params, timeout=10)
-                response.raise_for_status()
-                result = response.json()
-            except Exception as e:
-                logger.error(f"❌ children API failed: {e}")
-                break
-
-            for child in result.get("results", []):
-                if child.get("type") == "child_page":
-                    # 获取子页面详情
-                    try:
-                        page_detail = self.get_page(child["id"])
-                        all_children.append(page_detail)
-                    except Exception:
-                        pass
-
-            has_more = result.get("has_more", False)
-            start_cursor = result.get("next_cursor")
-
-        # 在客户端过滤 status
-        filtered = []
-        for lead in all_children:
-            status_prop = lead.get("properties", {}).get("Status", {})
-            if status_prop.get("select"):
-                if status_prop["select"].get("name") == status:
-                    filtered.append(lead)
-
-        logger.info(f"✅ Notion 查询 '{status}' 状态（内嵌数据库）: {len(filtered)} 条")
-        return filtered[:limit]
+        return self._get_children_leads(
+            filter_field=Field.STATUS,
+            filter_value=status,
+            limit=limit,
+        )
 
     def get_recent_leads(self, days: int = 1, limit: int = 100) -> List[Dict]:
         """
@@ -426,68 +515,86 @@ class NotionClient:
         Returns:
             潜在客户列表
         """
+        all_leads = self._get_children_leads(filter_field=None, filter_value=None, limit=limit)
         from datetime import timedelta
-        start_date = (datetime.now() - timedelta(days=days)).isoformat()
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        filtered = []
+        for lead in all_leads:
+            created = lead["metadata"].get(Field.CREATED_AT, "")
+            if created and created >= cutoff:
+                filtered.append(lead)
+        return filtered
 
-        if self._is_inline_database():
-            # 内嵌数据库：获取所有 children 然后客户端过滤
-            all_children = self._get_children_by_status(self.input_id, status="", limit=limit)
-            filtered = []
-            for lead in all_children:
-                created_prop = lead.get("properties", {}).get("Created At", {})
-                if created_prop.get("date"):
-                    if created_prop["date"].get("start", "") >= start_date:
-                        filtered.append(lead)
-            return filtered
-        else:
-            payload = {
-                "filter": {
-                    "property": "Created At",
-                    "date": {"on_or_after": start_date}
-                },
-                "sort": [{"property": "Created At", "direction": "descending"}],
-                "page_size": min(limit, 100)
-            }
-            result = self._request("POST", f"/databases/{self.database_id}/query", json=payload)
-            leads = result.get("results", [])
-            logger.info(f"✅ Notion 查询最近 {days} 天: {len(leads)} 条")
-            return leads
-
-    def get_email_by_page_id(self, page_id: str) -> Optional[str]:
+    def _get_children_leads(
+        self, filter_field: Optional[str], filter_value: Optional[str], limit: int
+    ) -> List[Dict]:
         """
-        通过 Notion 页面 ID 获取邮箱
+        列出页面下所有子页面（child_page），可按元数据过滤
 
         Args:
-            page_id: Notion 页面 ID
+            filter_field: 过滤字段名（None 不过滤）
+            filter_value: 过滤值
+            limit: 最多返回数量
 
         Returns:
-            邮箱地址（如果存在）
+            lead dict 列表
         """
-        try:
-            page = self.get_page(page_id)
-            email_prop = page.get("properties", {}).get("Email", {})
-            if email_prop.get("email"):
-                return email_prop["email"]
-        except Exception as e:
-            logger.error(f"❌ 获取邮箱失败 {page_id}: {e}")
-        return None
+        results = []
+        has_more = True
+        start_cursor = None
+
+        while has_more and len(results) < limit:
+            params = {"page_size": 100}
+            if start_cursor:
+                params["start_cursor"] = start_cursor
+            try:
+                data = self._request("GET", f"/blocks/{self.page_id}/children", params=params)
+            except Exception as e:
+                logger.error(f"❌ 列子页面失败: {e}")
+                break
+
+            for block in data.get("results", []):
+                if block.get("type") != "child_page":
+                    continue
+                try:
+                    lead = self.get_page(block["id"])
+                except Exception as e:
+                    logger.warning(f"⚠️ 跳过无法读取的子页面 {block.get('id')}: {e}")
+                    continue
+                # 必须有 Email 才是有效 lead
+                if not lead["metadata"].get(Field.EMAIL):
+                    continue
+                # 过滤
+                if filter_field and lead["metadata"].get(filter_field) != filter_value:
+                    continue
+                results.append(lead)
+                if len(results) >= limit:
+                    break
+
+            has_more = data.get("has_more", False)
+            start_cursor = data.get("next_cursor")
+
+        logger.info(
+            f"✅ Notion 查询子页面: filter={filter_field}={filter_value} → {len(results)} 条"
+        )
+        return results[:limit]
 
     # ==========================================
     # 健康检查
     # ==========================================
     def health_check(self) -> bool:
         """
-        检查 Notion 集成是否正常工作
+        检查 Notion 集成是否正常工作（能列出子页面）
 
         Returns:
             True 如果健康，False 如果失败
         """
         try:
-            # 内嵌数据库用 page endpoint，独立数据库用 database endpoint
-            if self._is_inline_database():
-                self._request("GET", f"/pages/{self.input_id}")
-            else:
-                self._request("GET", f"/databases/{self.database_id}")
+            # 1. 验证页面可访问
+            self._request("GET", f"/pages/{self.page_id}")
+            # 2. 验证能列出 children
+            params = {"page_size": 1}
+            self._request("GET", f"/blocks/{self.page_id}/children", params=params)
             logger.info("✅ Notion health check passed")
             return True
         except Exception as e:

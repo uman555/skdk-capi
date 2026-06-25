@@ -1,83 +1,94 @@
-# Notion 集成重新分享指南
+# Notion 集成配置（v2 - child_page 模型）
 
-> 修复 SKDK CAPI 集成的 Notion 访问问题
+> ✅ 2026-06-24 已修复：原"内嵌数据库"方案失败（数据库 404），现改为 child_page 模型。
 
-## 🔍 问题诊断
+## 🔍 问题诊断与最终方案
 
-```
-当前 NOTION_DATABASE_ID（无效）：
-389cae2a-241f-80a7-a772-eaedd8757b42 (这是 page_id)
+### 原方案（已废弃）
+- 假设 SKDK B2B Leads CRM 是**内嵌数据库**（child_database）
+- `NOTION_DATABASE_ID` 实际是 page_id
+- 真实 database_id = `389cae2a-241f-800c-9916-c92b5e65e396`，但该数据库**未分享给 Integration**（API 返回 404）
+- 即使分享，数据库 schema 也是空的（title/properties 都是空数组）
 
-正确的 database_id（需获取）：
-未知 - 你的数据库是内嵌的，Integration 还没分享到
-```
+### 当前方案（✅ 已工作）
+- **child_page 模型**：直接在 SKDK B2B Leads CRM 页面下创建**子页面**作为 lead
+- 页面 ID = `389cae2a-241f-80a7-a772-eaedd8757b42`（已分享给 Integration，可读写）
+- 子页面用 `title` 存姓名 + `bulleted_list_item` 内容块存元数据
 
-## 📋 你需要做的（3 步，5 分钟）
+## 📊 存储结构
 
-### Step 1: 在 Notion 中打开 SKDK B2B Leads CRM
-
-直接在 Notion 中打开你的数据库页面。
-
-### Step 2: 把 Integration 添加到数据库（不是页面）
-
-```
-1. 在数据库页面，右上角 "..."（三个点/更多）
-2. 菜单中找 "连接" / "Connections" / "Add connections"
-3. 搜索 "SKDK Notion Integration"
-4. 点击 → 确认添加
-5. ✅ 应该看到 "SKDK Notion Integration" 显示在连接列表中
-```
-
-**重要**：必须添加到**数据库**，不是页面。如果你之前只添加到了页面，请重新添加。
-
-### Step 3: 获取真正的 Database ID
+每个 lead 是一个 child_page：
 
 ```
-方法 A: 复制数据库链接
-1. 在数据库页面，右上角 "..." → "复制链接" / "Copy link"
-2. 粘贴到文本编辑器
-3. URL 格式：https://www.notion.so/workspace/[DATABASE_ID]?v=...
-4. [DATABASE_ID] 就是 32 位字符串
-5. ⚠️ 去掉所有连字符 (-)
-
-方法 B: 通过父级关系
-1. 在 Notion 中，数据库在 "页面" 内部
-2. 找到真正的数据库（不是页面）
-3. URL 中的 32 位 ID
-
-如果方法 A 和 B 都失败：
-- 联系 Notion 客服询问内嵌数据库的 ID 获取方式
-- 或考虑将数据库移到独立页面（推荐）
+📄 Sarah Johnson (title)
+├── 📧 Email: buyer-002@skdksport.com
+├── 🎯 Status: Qualified
+├── 🏢 Company: Pacific Coast Sports
+├── 🌍 Country: United States
+├── 📞 Phone: +1-555-0199
+├── 💼 Business Type: Distributor / Wholesaler
+├── 📊 Monthly Volume: 1,000-5,000 units
+├── 🎁 Products: Knee Support | Wrist Support
+├── 💰 Lead Value: 2500
+├── 🕐 Created At: 2026-06-24T22:34:58
+├── 🕐 Status Updated At: 2026-06-24T22:35:53
+├── 📡 Source: Meta Lead Form
+└── 📝 Notes: ...
 ```
 
-## 📝 获得 Database ID 后告诉我
+## ✅ 验证结果（2026-06-24 22:36）
 
-把 32 位字符串（去掉连字符）发给我，我会：
-1. 更新 .env 文件
-2. 重新启动服务
-3. 重新测试完整 CAPI 流程
-4. 发送测试事件到 Meta
+| 测试项 | 状态 |
+|--------|------|
+| `pytest tests/test_notion_client.py -v` | ✅ 17 passed |
+| `GET /health` | ✅ `{"notion":"ok","status":"healthy"}` |
+| `POST /webhook/lead-submitted` | ✅ Notion + CAPI 全部成功 |
+| `POST /webhook/status-update` | ✅ CAPI `SKDK_Lead_Qualified` 已发送 |
+| `notion.update_status()` | ✅ Notion 字段已更新（Status + Updated At）|
+| `notion.get_leads_by_status()` | ✅ 正确过滤 + 1 个 Qualified |
+| `POST /api/supplementary` | ✅ 1 事件发送，0 错误 |
 
-## 💡 临时变通方案
+## 🔧 当前 .env 配置
 
-如果你现在没时间重新分享，可以：
-- ✅ 继续测试 CAPI 发送（这不依赖 Notion）
-- ✅ 在 Meta 端验证事件是否接收
-- ✅ 准备 Railway 部署
-- ⏸️ 暂停 Notion 集成的完整测试
+```env
+# Notion
+NOTION_INTEGRATION_TOKEN=ntn_REDACTED_FOR_SECURITY
+# 这是**页面 ID**（虽然变量名是 DATABASE_ID，保持向后兼容）
+NOTION_DATABASE_ID=389cae2a-241f-80a7-a772-eaedd8757b42
 
-## 🔄 已有的临时方案
+# Meta
+META_DATASET_ID=1723656532148251
+META_APP_ID=1554011292941689
+META_ACCESS_TOKEN=EAAWFXXMX3LkBR0...
+```
 
-我已经让代码支持两种 Notion ID 模式：
-- **Database ID 模式**（推荐）：直接访问数据库
-- **Page ID 模式**（临时）：创建子页面（但只能设置 title）
+> **注意**：`NOTION_DATABASE_ID` 这个变量名虽然保留，但实际存的是**页面 ID**。代码内部已统一使用 `page_id` 语义。
 
-如果 Database ID 暂时无法获取，我们可以先用 Page ID 模式跑通 CAPI 发送，但需要在 Notion UI 中手动完善其他字段。
+## 🛠️ 未来可优化（可选）
 
-## 🎯 最佳路径
+### 选项 1：保持 child_page 模型（推荐，简单可靠）
+- ✅ 优点：不需要用户额外操作，Notion UI 中可读性高
+- ❌ 缺点：无法在 Notion 表格视图查看全部 lead（需要切到页面视图）
 
-1. **你**重新分享 Notion Integration 到数据库 + 给我 Database ID（5 分钟）
-2. **我**立即更新 .env + 重新测试 + 部署 Railway
-3. **完成**整个 CAPI 集成系统上线
+### 选项 2：让用户把页面升级为数据库
+- 用户在 Notion 中：把 "SKDK B2B Leads CRM" 页面转换为数据库
+- 然后分享该数据库给 Integration
+- 代码需要小改：property 名要重新映射
 
-需要我帮你做其他的吗？
+### 选项 3：手动分享原数据库给 Integration
+- 用户在 Notion 中：找到真实 database（`389cae2a-241f-800c-9916-c92b5e65e396`）
+- 右上角 "..." → "连接" → 添加 "SKDK Notion Integration"
+- 但该数据库 schema 是空的（title/properties 都为空），需要先添加 property 字段
+- 不推荐：成本高，收益小
+
+## 📝 维护 SOP
+
+### 每周
+- 检查 `/health` 状态 → 确认 Notion 子页面可读
+- 查看 Railway 日志 → 确认 CAPI 事件正常发送
+- 抽查 1-2 个 lead 的 Notion 字段完整性
+
+### 每月
+- 检查 Notion Integration 权限（页面仍需在分享列表中）
+- 验证 Meta Token 未过期
+- 分析 lead 数据质量（Email/Status 字段是否完整）

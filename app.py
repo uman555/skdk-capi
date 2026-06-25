@@ -162,8 +162,8 @@ def supplementary_upload():
             for lead in leads:
                 try:
                     page_id = lead["id"]
-                    email_prop = lead.get("properties", {}).get("Email", {})
-                    email = email_prop.get("email")
+                    # child_page 模型：元数据存在 metadata dict 里
+                    email = lead.get("metadata", {}).get("Email")
                     if not email:
                         continue
 
@@ -173,8 +173,11 @@ def supplementary_upload():
                         "lead_id": page_id,
                     }
                     if status == "Customer":
-                        value_prop = lead.get("properties", {}).get("Lead Value", {})
-                        value = value_prop.get("number", 0)
+                        value_str = lead.get("metadata", {}).get("Lead Value", "")
+                        try:
+                            value = float(value_str) if value_str else 0
+                        except (ValueError, TypeError):
+                            value = 0
                         if value:
                             capi_kwargs["value"] = value
 
