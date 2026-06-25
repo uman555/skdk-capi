@@ -52,14 +52,14 @@
 
 ```env
 # Notion
-NOTION_INTEGRATION_TOKEN=ntn_REDACTED_FOR_SECURITY
+NOTION_INTEGRATION_TOKEN=<your-notion-integration-token>
 # 这是**页面 ID**（虽然变量名是 DATABASE_ID，保持向后兼容）
 NOTION_DATABASE_ID=389cae2a-241f-80a7-a772-eaedd8757b42
 
 # Meta
-META_DATASET_ID=1723656532148251
-META_APP_ID=1554011292941689
-META_ACCESS_TOKEN=EAAWFXXMX3LkBR0...
+META_DATASET_ID=<your-meta-dataset-id>
+META_APP_ID=<your-meta-app-id>
+META_ACCESS_TOKEN=<your-meta-access-token>
 ```
 
 > **注意**：`NOTION_DATABASE_ID` 这个变量名虽然保留，但实际存的是**页面 ID**。代码内部已统一使用 `page_id` 语义。
