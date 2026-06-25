@@ -1,0 +1,116 @@
+name: Hourly Token Refresh (Fallback)
+
+on:
+  schedule:
+    # 每 50 分钟跑一次（比 1-2h 过期时间早）
+    - cron: '*/50 * * * *'
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install requests
+
+      - name: Check current token validity
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+        run: |
+          python -X utf8 -c "
+          import os, requests
+          from datetime import datetime
+          token = os.environ['META_ACCESS_TOKEN']
+          r = requests.get('https://graph.facebook.com/v18.0/debug_token',
+                          params={'input_token': token, 'access_token': token})
+          data = r.json()['data']
+          if 'expires_at' in data:
+              exp = datetime.fromtimestamp(data['expires_at'])
+              hours_left = (exp - datetime.now()).total_seconds() / 3600
+              print(f'Expires: {exp} ({hours_left:.1f} hours)')
+              if hours_left > 6:
+                  print('Token OK, skipping')
+                  exit(0)
+          else:
+              print('No expiration - long-lived or System User')
+              exit(0)
+          print('Token expiring soon, needs refresh')
+          exit(1)  # 触发续期
+          "
+
+      - name: Refresh via Graph API Explorer flow
+        if: failure()  # 仅在 token 即将过期时执行
+        env:
+          FB_EMAIL: ${{ secrets.FB_EMAIL }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          META_APP_ID: ${{ secrets.META_APP_ID }}
+          META_APP_SECRET: ${{ secrets.META_APP_SECRET }}
+        run: |
+          python -X utf8 -c "
+          import os, requests
+
+          # 1. OAuth 登录获取 authorization code
+          app_id = os.environ['META_APP_ID']
+          app_secret = os.environ['META_APP_SECRET']
+          email = os.environ['FB_EMAIL']
+          password = os.environ['FB_PASSWORD']
+
+          # 用 Graph API 直接换 long-lived token
+          current = os.environ.get('META_ACCESS_TOKEN', '')
+
+          r = requests.get('https://graph.facebook.com/v18.0/oauth/access_token',
+                          params={
+                              'grant_type': 'fb_exchange_token',
+                              'client_id': app_id,
+                              'client_secret': app_secret,
+                              'fb_exchange_token': current,
+                          })
+          result = r.json()
+          if 'access_token' in result:
+              new_token = result['access_token']
+              print(f'NEW_TOKEN={new_token}')
+              # 输出到 $GITHUB_OUTPUT 用于后续步骤
+              with open('/tmp/new_token', 'w') as f:
+                  f.write(new_token)
+          else:
+              print('ERROR:', result)
+              exit(1)
+          "
+
+      - name: Update GitHub Secret
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          if [ -f /tmp/new_token ]; then
+            NEW_TOKEN=$(cat /tmp/new_token)
+            python -X utf8 -c "
+          import os, requests
+          from nacl import encoding, public
+          
+          gh_token = os.environ['GH_TOKEN']
+          repo = 'uman555/skdk-capi'
+          secret_name = 'META_ACCESS_TOKEN'
+          
+          # 获取 public key
+          r = requests.get(f'https://api.github.com/repos/{repo}/actions/secrets/public-key',
+                          headers={'Authorization': f'token {gh_token}', 'Accept': 'application/vnd.github+json'})
+          pub = r.json()
+          
+          # 加密
+          sealed = public.SealedBox(public.PublicKey(pub['key'].encode()))
+          encrypted = sealed.encrypt(os.environ['NEW_TOKEN'].encode())
+          encoded = encoding.Base64Encoder.encode(encrypted).decode()
+          
+          # 更新
+          r = requests.put(f'https://api.github.com/repos/{repo}/actions/secrets/{secret_name}',
+                          headers={'Authorization': f'token {gh_token}', 'Accept': 'application/vnd.github+json'},
+                          json={'encrypted_value': encoded, 'key_id': pub['key_id']})
+          print('Update result:', r.status_code)
+          "
+          fi
