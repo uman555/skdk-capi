@@ -78,6 +78,40 @@
 
 ---
 
+### 替代方案：GitHub Actions 定时调用（推荐 ✅）
+
+> 已自动部署在 `.github/workflows/daily-cron.yml`，只需配置 1 个 secret。
+
+#### 配置步骤
+
+1. GitHub repo → **Settings** → **Secrets and variables** → **Actions**
+2. **New repository secret**：
+   - Name: `APP_URL`
+   - Value: `https://skdk-capi-production.up.railway.app`
+3. 完成！
+
+#### 工作原理
+
+```
+每天 UTC 15:00（北京时间 23:00）
+   ↓
+GitHub Actions 自动触发
+   ↓
+POST https://skdk-capi-production.up.railway.app/api/supplementary
+   ↓
+Railway 处理补充上传
+   ↓
+返回结果到 GitHub Actions 日志
+```
+
+#### 优点（vs Railway scheduler）
+- ✅ 免费（GitHub Actions 免费额度 2000 分钟/月）
+- ✅ 可靠（GitHub SLA 99.9%）
+- ✅ 无需维护第二个服务
+- ✅ 日志可在 GitHub Actions 页面查看
+
+---
+
 ### 2. 配置 Zapier（创建 1 个 Zap）
 
 > Meta Lead Form 提交 → 自动调用 webhook 创建 Notion 记录 + 发 CAPI

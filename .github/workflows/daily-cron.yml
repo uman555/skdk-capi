@@ -1,0 +1,53 @@
+# SKDK CAPI - 每日补充上传定时任务
+#
+# 每天 UTC 15:00（北京时间 23:00）触发
+# 调用 Railway 部署的 /api/supplementary 端点
+# 确保 Meta 学习期 50 转化数据完整性
+#
+# 配置：
+#   1. GitHub repo → Settings → Secrets → New repository secret
+#   2. Name: APP_URL
+#   3. Value: https://skdk-capi-production.up.railway.app
+
+name: Daily CAPI Supplementary Upload
+
+on:
+  schedule:
+    # UTC 15:00 = 北京时间 23:00
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    # 允许手动触发（Actions 页面 → Run workflow）
+
+jobs:
+  supplementary-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger /api/supplementary
+        run: |
+          APP_URL="${{ secrets.APP_URL }}"
+          if [ -z "$APP_URL" ]; then
+            echo "❌ APP_URL secret is not set"
+            echo "   请在 GitHub repo → Settings → Secrets 添加 APP_URL"
+            exit 1
+          fi
+
+          echo "🚀 调用 $APP_URL/api/supplementary ..."
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+            -X POST "$APP_URL/api/supplementary" \
+            -H "Content-Type: application/json" \
+            -d '{"days": 1}')
+
+          HTTP_STATUS=$(echo "$RESPONSE" | grep -o "HTTP_STATUS:[0-9]*" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | grep -v "HTTP_STATUS:")
+
+          echo "📊 HTTP Status: $HTTP_STATUS"
+          echo "📊 Response: $BODY"
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ 补充上传失败 (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+
+          echo "✅ 每日补充上传完成"
