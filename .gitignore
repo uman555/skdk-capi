@@ -58,3 +58,7 @@ Thumbs.db
 
 # 跟踪文件
 .cp-man/
+
+# Sensitive local files
+new_long_lived_token.txt
+*.token.txt
